@@ -184,4 +184,5 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
         }
     )
 else:
-    st.info("아이템 이름 컬럼(item0_name~item6_name)이 없어 챔피언별 아이템 집
+    st.info("아이템 이름 컬럼(item0_name~item6_name)이 없어 챔피언별 아이템 집계를 만들 수 없습니다.")
+
