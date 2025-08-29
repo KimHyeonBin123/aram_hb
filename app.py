@@ -4,13 +4,12 @@ import pandas as pd
 import streamlit as st
 import requests
 import json
-import uuid
 
 # ==============================
 # ✅ 네이버 Clova 생성형 AI 설정
 # ==============================
-ACCESS_KEY = "ncp_iam_BPAMKR2DUA9LsitOQiAq"
-SECRET_KEY = "ncp_iam_BPKMKRM9ooQXpjc8M2i61r6CrfyzEo4k3H"
+ACCESS_KEY = ""  # 네이버 AI API Access Key
+SECRET_KEY = ""  # 네이버 AI API Secret Key
 API_URL = "https://clovastudio.stream.ntruss.com/testapp/v1/chat-completions/HCX-003"
 
 # ==============================
@@ -127,7 +126,7 @@ spell_map = load_spell_icons(SPELL_CSV)
 ITEM_ICON_MAP = dict(zip(item_sum.get("item", []), item_sum.get("icon_url", [])))
 
 # ==============================
-# 사이드바
+# 사이드바 — 챔피언 선택
 # ==============================
 st.sidebar.title("ARAM PS Controls")
 champs = sorted(df["champion"].dropna().unique().tolist()) if "champion" in df.columns else []
@@ -146,8 +145,7 @@ pickrate = round((match_cnt_sel / match_cnt_all * 100), 2) if match_cnt_all else
 c0, ctitle = st.columns([1,5])
 with c0:
     cicon = champ_map.get(selected, "")
-    if cicon:
-        st.image(cicon, width=64)
+    if cicon: st.image(cicon, width=64)
 with ctitle:
     st.title(f"{selected}")
 
@@ -174,7 +172,6 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
     top_items["win_rate"] = (top_items["wins"]/top_items["total_picks"]*100).round(2)
     top_items["icon_url"] = top_items["item"].map(ITEM_ICON_MAP)
     top_items = top_items.sort_values(["total_picks","win_rate"], ascending=[False, False]).head(20)
-
     st.dataframe(
         top_items[["icon_url","item","total_picks","wins","win_rate"]],
         use_container_width=True,
@@ -186,3 +183,36 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
 else:
     st.info("아이템 이름 컬럼(item0_name~item6_name)이 없어 챔피언별 아이템 집계를 만들 수 없습니다.")
 
+# ==============================
+# AI 기반 5챔프 조합 승률 예측
+# ==============================
+st.sidebar.subheader("AI 5챔프 승률 예측")
+team_input = st.sidebar.text_input("팀 챔피언 5개 입력 (콤마로 구분)", "")
+if st.sidebar.button("AI 분석 실행") and team_input:
+    champs_list = [c.strip() for c in team_input.split(",") if c.strip()]
+    if len(champs_list) != 5:
+        st.sidebar.warning("정확히 5개의 챔피언을 입력해주세요.")
+    else:
+        headers = {
+            "X-NCP-APIGW-API-KEY-ID": ACCESS_KEY,
+            "X-NCP-APIGW-API-KEY": SECRET_KEY,
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "HCX-003",
+            "messages": [
+                {"role": "user", "content": f"칼바람 조합 승률 분석: {', '.join(champs_list)}"}
+            ],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_tokens": 300
+        }
+        try:
+            response = requests.post(API_URL, headers=headers, data=json.dumps(data))
+            res_json = response.json()
+            ai_text = res_json.get("choices", [{}])[0].get("message", {}).get("content", "AI 결과 없음")
+        except Exception as e:
+            ai_text = f"AI 호출 중 오류 발생: {e}"
+
+        st.subheader("AI 분석 결과")
+        st.write(ai_text)
