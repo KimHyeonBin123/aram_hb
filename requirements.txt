@@ -4,3 +4,6 @@ plotly
 streamlit==1.36.0
 pandas>=2.0
 requests
+numpy
+scikit-learn
+torch==2.8.0+cpu
