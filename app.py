@@ -1,223 +1,91 @@
-# app.py — ARAM 챔피언 대시보드 + AI 조합 분석
-import os, re
-import pandas as pd
-import streamlit as st
-import requests
-import json
+# ==============================
+# 🔹 학습 모델 기반 승리 확률 예측
+# ==============================
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import OneHotEncoder
+import pickle
 
-# ==============================
-# ✅ 네이버 Clova 생성형 AI 설정
-# ==============================
-ACCESS_KEY = "YOUR_ACCESS_KEY"
-SECRET_KEY = "YOUR_SECRET_KEY"
-API_URL = "https://clovastudio.stream.ntruss.com/testapp/v1/chat-completions/HCX-003"
+# 모델 정의
+class MatchMLP(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.model(x)
 
-# ==============================
-# Streamlit 페이지 설정
-# ==============================
-st.set_page_config(page_title="ARAM PS Dashboard + AI 분석", layout="wide")
+# 컬럼 (학습 때 사용한 순서)
+cat_cols = [
+    "championName", "individualPosition", "lane", "teamPosition", "role",
+    "summoner1Id", "summoner2Id"
+]
 
-# ==============================
-# 파일 경로
-# ==============================
-PLAYERS_CSV   = "aram_participants_with_icons_superlight.csv"
-ITEM_SUM_CSV  = "item_summary_with_icons.csv"
-CHAMP_CSV     = "champion_icons.csv"
-RUNE_CSV      = "rune_icons.csv"
-SPELL_CSV     = "spell_icons.csv"
+num_cols = [
+    "kills", "deaths", "assists",
+    "largestKillingSpree", "largestMultiKill",
+    "doubleKills", "tripleKills", "quadraKills", "pentaKills",
+    "totalDamageDealt", "totalDamageDealtToChampions", "totalDamageTaken",
+    "damageSelfMitigated",
+    "physicalDamageDealt", "magicDamageDealt", "trueDamageDealt",
+    "physicalDamageDealtToChampions", "magicDamageDealtToChampions", "trueDamageDealtToChampions",
+    "physicalDamageTaken", "magicDamageTaken", "trueDamageTaken",
+    "timeCCingOthers", "totalTimeCCDealt",
+    "goldEarned", "goldSpent", "itemsPurchased", "consumablesPurchased",
+    "turretKills", "turretTakedowns", "turretsLost",
+    "inhibitorKills", "inhibitorTakedowns", "inhibitorsLost",
+    "baronKills", "dragonKills",
+    "damageDealtToTurrets", "damageDealtToObjectives",
+    "visionScore", "wardsPlaced", "wardsKilled", "visionWardsBoughtInGame",
+    "longestTimeSpentLiving", "timePlayed"
+]
 
-DD_VERSION = "15.16.1"  # Data Dragon 폴백
+st.subheader("AI 학습 모델 승리 확률 예측")
 
-# ==============================
-# 유틸
-# ==============================
-def _exists(path: str) -> bool:
-    ok = os.path.exists(path)
-    if not ok:
-        st.warning(f"파일 없음: `{path}`")
-    return ok
+# 입력 UI
+input_data = {}
+st.write("⚡ 입력값 수정 후 예측 가능")
 
-def _norm(x: str) -> str:
-    return re.sub(r"\s+", "", str(x)).strip().lower()
+for col in num_cols:
+    input_data[col] = st.number_input(col, value=0)
 
-# ==============================
-# 데이터 로더
-# ==============================
-@st.cache_data
-def load_players(path: str) -> pd.DataFrame:
-    if not _exists(path): st.stop()
-    df = pd.read_csv(path, encoding='utf-8')
-    if "win_clean" not in df.columns:
-        if "win" in df.columns:
-            df["win_clean"] = df["win"].astype(str).str.lower().isin(["true","1","t","yes"]).astype(int)
-        else:
-            df["win_clean"] = 0
-    for c in [c for c in df.columns if re.fullmatch(r"item[0-6]_name", c)]:
-        df[c] = df[c].fillna("").astype(str).str.strip()
-    for c in ["spell1","spell2","spell1_name_fix","spell2_name_fix","rune_core","rune_sub","champion"]:
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str).str.strip()
-    return df
+for col in cat_cols:
+    input_data[col] = st.text_input(col, value="Unknown")
 
-@st.cache_data
-def load_item_summary(path: str) -> pd.DataFrame:
-    if not _exists(path): return pd.DataFrame()
-    g = pd.read_csv(path)
-    need = {"item","icon_url","total_picks","wins","win_rate"}
-    if not need.issubset(g.columns):
-        st.warning(f"`{path}` 헤더 확인 필요")
-    if "item" in g.columns:
-        g = g[g["item"].astype(str).str.strip() != ""]
-    return g
+df_input = pd.DataFrame([input_data])
 
-@st.cache_data
-def load_champion_icons(path: str) -> dict:
-    if not _exists(path): return {}
-    df = pd.read_csv(path)
-    name_col = next((c for c in ["champion","Champion","championName"] if c in df.columns), None)
-    icon_col = next((c for c in ["champion_icon","icon","icon_url"] if c in df.columns), None)
-    if not name_col or not icon_col: return {}
-    df[name_col] = df[name_col].astype(str).str.strip()
-    return dict(zip(df[name_col], df[icon_col]))
-
-@st.cache_data
-def load_rune_icons(path: str) -> dict:
-    if not _exists(path): return {"core": {}, "sub": {}, "shards": {}}
-    df = pd.read_csv(path)
-    core_map, sub_map, shard_map = {}, {}, {}
-    if "rune_core" in df.columns:
-        ic = "rune_core_icon" if "rune_core_icon" in df.columns else None
-        if ic: core_map = dict(zip(df["rune_core"].astype(str), df[ic].astype(str)))
-    if "rune_sub" in df.columns:
-        ic = "rune_sub_icon" if "rune_sub_icon" in df.columns else None
-        if ic: sub_map = dict(zip(df["rune_sub"].astype(str), df[ic].astype(str)))
-    if "rune_shard" in df.columns:
-        ic = "rune_shard_icon" if "rune_shard_icon" in df.columns else ("rune_shards_icons" if "rune_shards_icons" in df.columns else None)
-        if ic: shard_map = dict(zip(df["rune_shard"].astype(str), df[ic].astype(str)))
-    return {"core": core_map, "sub": sub_map, "shards": shard_map}
-
-@st.cache_data
-def load_spell_icons(path: str) -> dict:
-    if not _exists(path): return {}
-    df = pd.read_csv(path)
-    cand_name = [c for c in df.columns if _norm(c) in {"spell","spellname","name","spell1_name_fix","spell2_name_fix","스펠","스펠명"}]
-    cand_icon = [c for c in df.columns if _norm(c) in {"icon","icon_url"} or "icon" in c.lower()]
-    m = {}
-    if cand_name and cand_icon:
-        name_col, icon_col = cand_name[0], cand_icon[0]
-        for n, i in zip(df[name_col].astype(str), df[icon_col].astype(str)):
-            m[_norm(n)] = i
-            m[str(n).strip()] = i
-    else:
-        if df.shape[1] >= 2:
-            for n, i in zip(df.iloc[:,0].astype(str), df.iloc[:,1].astype(str)):
-                m[_norm(n)] = i
-                m[str(n).strip()] = i
-    return m
-
-# ==============================
-# AI 팀 분석 함수
-# ==============================
-def get_ai_team_analysis(team_champs: list) -> str:
-    headers = {
-        "X-NCP-APIGW-API-KEY-ID": ACCESS_KEY,
-        "X-NCP-APIGW-API-KEY": SECRET_KEY,
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "HCX-003",
-        "messages": [{"role":"user", "content": f"칼바람 팀 {', '.join(team_champs)}의 승률을 알려줘"}],
-        "temperature":0.7,
-        "max_tokens":500
-    }
-
-    response = requests.post(API_URL, headers=headers, data=json.dumps(data))
-    st.write("API 점검:", response.status_code, response.text)  # ← 여기서 상태코드 확인 가능
-    if response.status_code != 200:
-        return f"AI 호출 실패: {response.status_code}"
-    res_json = response.json()
-    ai_text = res_json.get("choices", [{}])[0].get("message", {}).get("content", "AI 결과 없음")
-    return ai_text
-
-# ==============================
-# 데이터 로드
-# ==============================
-df        = load_players(PLAYERS_CSV)
-item_sum  = load_item_summary(ITEM_SUM_CSV)
-champ_map = load_champion_icons(CHAMP_CSV)
-rune_maps = load_rune_icons(RUNE_CSV)
-spell_map = load_spell_icons(SPELL_CSV)
-ITEM_ICON_MAP = dict(zip(item_sum.get("item", []), item_sum.get("icon_url", [])))
-
-# ==============================
-# 사이드바 — 챔피언 선택
-# ==============================
-st.sidebar.title("ARAM PS Controls")
-champs = sorted(df["champion"].dropna().unique().tolist()) if "champion" in df.columns else []
-selected = st.sidebar.selectbox("Champion", champs, index=0 if champs else None)
-
-# ==============================
-# 상단 요약 — 선택 챔피언
-# ==============================
-dsel = df[df["champion"] == selected].copy() if len(champs) else df.head(0).copy()
-games = len(dsel)
-match_cnt_all = df["matchId"].nunique() if "matchId" in df.columns else len(df)
-match_cnt_sel = dsel["matchId"].nunique() if "matchId" in dsel.columns else games
-winrate = round(dsel["win_clean"].mean()*100, 2) if games else 0.0
-pickrate = round((match_cnt_sel / match_cnt_all * 100), 2) if match_cnt_all else 0.0
-
-c0, ctitle = st.columns([1,5])
-with c0:
-    cicon = champ_map.get(selected, "")
-    if cicon:
-        st.image(cicon, width=64)
-with ctitle:
-    st.title(f"{selected}")
-
-c1, c2, c3 = st.columns(3)
-c1.metric("Games", f"{games}")
-c2.metric("Win Rate", f"{winrate}%")
-c3.metric("Pick Rate", f"{pickrate}%")
-
-# ==============================
-# AI 팀 조합 분석 UI
-# ==============================
-st.subheader("AI 칼바람 팀 승률 분석")
-team_input = st.text_input("팀 챔피언 5명 (쉼표로 구분)", "갱플랭크,럭스,알리스타,다리우스,티모")
-if st.button("AI 분석"):
-    team_list = [x.strip() for x in team_input.split(",") if x.strip()]
-    if len(team_list) != 5:
-        st.warning("챔피언 5명을 정확히 입력해주세요!")
-    else:
-        ai_result = get_ai_team_analysis(team_list)
-        st.text_area("AI 분석 결과", ai_result, height=200)
-
-# ==============================
-# 기존 아이템 추천 등 코드는 그대로 유지
-# ==============================
-st.subheader("Recommended Items")
-if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
-    stacks = []
-    for c in [c for c in dsel.columns if re.fullmatch(r"item[0-6]_name", c)]:
-        stacks.append(dsel[[c, "win_clean"]].rename(columns={c: "item"}))
-    union = pd.concat(stacks, ignore_index=True)
-    union = union[union["item"].astype(str).str.strip() != ""]
-    top_items = (
-        union.groupby("item")
-        .agg(total_picks=("item","count"), wins=("win_clean","sum"))
-        .reset_index()
-    )
-    top_items["win_rate"] = (top_items["wins"]/top_items["total_picks"]*100).round(2)
-    top_items["icon_url"] = top_items["item"].map(ITEM_ICON_MAP)
-    top_items = top_items.sort_values(["total_picks","win_rate"], ascending=[False, False]).head(20)
-
-    st.dataframe(
-        top_items[["icon_url","item","total_picks","wins","win_rate"]],
-        use_container_width=True,
-        column_config={
-            "icon_url": st.column_config.ImageColumn("아이콘", width="small"),
-            "item": "아이템", "total_picks": "픽수", "wins": "승수", "win_rate": "승률(%)"
-        }
-    )
+# OneHotEncoder 로드
+if _exists("encoder.pkl"):
+    with open("encoder.pkl", "rb") as f:
+        encoder = pickle.load(f)
+    X_cat = encoder.transform(df_input[cat_cols].fillna("Unknown"))
 else:
-    st.info("아이템 이름 컬럼(item0_name~item6_name)이 없어 챔피언별 아이템 집계를 만들 수 없습니다.")
+    st.warning("encoder.pkl 파일이 없어 예측 불가")
+    X_cat = None
+
+X_num = df_input[num_cols].fillna(0).values
+
+if X_cat is not None:
+    X_input = torch.tensor(pd.concat([pd.DataFrame(X_num), pd.DataFrame(X_cat)], axis=1).values, dtype=torch.float32)
+
+    # 모델 불러오기
+    input_dim = X_input.shape[1]
+    model = MatchMLP(input_dim)
+    if _exists("match_model.pt"):
+        model.load_state_dict(torch.load("match_model.pt"))
+        model.eval()
+    else:
+        st.warning("match_model.pt 파일이 없어 예측 불가")
+        model = None
+
+    if model is not None and st.button("승리 확률 예측"):
+        with torch.no_grad():
+            y_pred = model(X_input)
+            win_prob = y_pred.item() * 100
+            st.success(f"승리 확률: {win_prob:.2f}%")
